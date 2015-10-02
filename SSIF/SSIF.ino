@@ -1,70 +1,338 @@
-/*************************************
+/*************************************************
  * SSIF for DB
- *  15/09/11  Rev.0.0  shiu  New.
- *************************************/
+ *  15/09/28  Rev.1.0  New.
+ *  15/09/29  Rev.1.1  add SERIAL_LINE_DELAY
+ *************************************************/
 #include "dv32u.h"
 
-String PVER = "0.0";
+String PVER = "1.1";
 String PNAME = "SSIF";
-String DELIMITER = ":";
 
-int Sr700ReadPin = PD6;
+boolean DBG = false; // Debug Mode
+
+const int SERIAL_LINE_DELAY = 20; // send line delay ms.
+
+
+/* Serial */
+String strSerialIncomingSsif = "";         // a string to hold incoming data
+String strSerialIncomingSr700 = "";        // a string to hold incoming data
+boolean blnStringCompleteSsif = false;     // whether the string is complete
+boolean blnStringCompleteSr700 = false;    // whether the string is complete
+
+
+/* Pins */
+//  name              DaVinci Pin Name
+int Sr700ReadPin    = PD6;
 int Sr700NothingPin = PD7;
-int Sr700OkPin  = PF7;
-int Sr700NgPin  = PF6;
-int Sr700ErrorPin  = PF5;
-int Sr700BusyPin  = PF4;
+int Sr700OkPin      = PF7;
+int Sr700NgPin      = PF6;
+int Sr700ErrorPin   = PF5;
+int Sr700BusyPin    = PF4;
 
+int dbIn1Pin = PB0; // DB IN1
+int dbIn2Pin = PB1; // DB IN2
+int dbIn3Pin = PB2; // DB IN3
+int dbIn4Pin = PB3; // DB IN4
 
-int dbIn1Pin = PB0; // IN1
-int dbIn2Pin = PB1; // IN2
-int dbIn3Pin = PB2; // IN3
-int dbIn4Pin = PB3; // IN4
+int dbOut1Pin = PB4; // DB OUT1
+int dbOut2Pin = PB5; // DB OUT2
+int dbOut3Pin = PB6; // DB OUT3
+int dbOut4Pin = PB7; // DB OUT4
 
+int ledPin = PC7; // LED
+
+// alias
 int startPin    = dbIn1Pin;
 int lotClearPin = dbIn2Pin;
+int busyPin     = dbOut1Pin;
+int okPin       = dbOut2Pin;
+int ngPin       = dbOut3Pin;
 
-int dbOut1Pin = PB4; // OUT1
-int dbOut2Pin = PB5; // OUT2
-int dbOut3Pin = PB6; // OUT3
-int dbOut4Pin = PB7; // OUT4
+// variables
+String frameId = "";
 
-int busyPin = dbOut1Pin;
-int okPin   = dbOut2Pin;
-int ngPin   = dbOut3Pin;
+// consts
+unsigned long ResultTimeOutMs = 20000;
+
+/*************************************
+ setup()
+ *************************************/
+void setup() {
+
+  initializePins();
+  initializeSerials();
+
+  /* initialize */
+  // Not ready because SSIF Serial Port does not Open
+  busy_on();
+
+  // loop() is not start till SSIF Serial Port Open
+  while (!Serial);
+
+  _debug("-----------");
+  _debug("SSIF Start!");
+  _debug("-----------");
+  _debug("(Wait until SSIF is ready [R:]....)"); //debug
+}
+
+/*************************************
+ loop()
+ *************************************/
+
+void loop() {
+  static boolean ssifReadyFlg = false;
+  int iResult = 0; //
+
+  /* Wait for SSif is ready */
+  if (serialCheckSsif()) {
+    String ssifIncoming = readSsif();
+    _debug("SerialSsif Recieve:[" + ssifIncoming + "]");
+
+    // SSIF READY
+    if (ssifIncoming == "R:") {
+      _debug("(SSIF is READY.)");
+      ssifReadyFlg = true;
+      clearSr700();
+      resetPins();
+      busy_off();
+    }
+
+    // SSIF NOT READY
+    else if (ssifIncoming == "r:") {
+      _debug("(SSIF is NOT READY.)");
+      ssifReadyFlg = false;
+      clearOkNg();
+      clearSr700();
+      busy_on();
+    }
+
+    /* for debug */
+    if (!ssifReadyFlg) {
+      // - Output Signal Debug
+      if (ssifIncoming == "O1:") {
+        busy_on();
+        goto LAST;
+      }
+      else if (ssifIncoming == "O2:") {
+        ok_on();
+        goto LAST;
+      }
+      else if (ssifIncoming == "O3:") {
+        ng_on();
+        goto LAST;
+      }
+      else if (ssifIncoming == "O4:") {
+        out4_on();
+        goto LAST;
+      }
+      else if (ssifIncoming == "o1:") {
+        busy_off();
+        goto LAST;
+      }
+      else if (ssifIncoming == "o2:") {
+        ok_off;
+        goto LAST;
+      }
+      else if (ssifIncoming == "o3:") {
+        ng_off();
+        goto LAST;
+      }
+      else if (ssifIncoming == "o4:") {
+        out4_off;
+        goto LAST;
+      }
+
+      // - Input Signal Debug
+      else if (ssifIncoming == "i:") {
+        String str = "i:";
+        str += String(!digitalRead(dbIn1Pin));
+        str += String(!digitalRead(dbIn2Pin));
+        str += String(!digitalRead(dbIn3Pin));
+        str += String(!digitalRead(dbIn4Pin));
+        sendSsif(str);
+        goto LAST;
+      }
+
+      // - debug mode sw
+      else if (ssifIncoming == "D:") {
+        DBG = true;
+        _debug("(Debug Mode = ON)");
+        goto LAST;
+      }
+      else if (ssifIncoming == "d:") {
+        DBG = false;
+        goto LAST;
+      }
+
+    }
+  }
+
+  /* If SSIF is not ready, jump to LAST:.*/
+  if (!ssifReadyFlg) {
+    goto LAST;
+  }
+
+  /* Check to Fid incoming. */
+  if (serialCheckSr700()) {
+    String sr700Incoming = readSr700();
+    _debug("Serialsr700 Recieve:[" + sr700Incoming + "]");
+    frameId = sr700Incoming;
+    _debug("FrameId = " + frameId); // for debug
+  }
+
+  /* Check the LotClear Signal. */
+  if (readLotClearPin() && ssifReadyFlg) {
+    _debug("Recieve Lot Clear Signal.");
+    _debug("send [L:] to SSIF.");
+    clearOkNg();
+    ssifReadyFlg = false;
+    frameId = "";
+    busy_on();
+    sendSsif("L:"); // send Lot Clear to SSIF
+    goto LAST;
+  }
+
+  /* check for the Start Signal. */
+  if (!readStartPin()) {
+    goto LAST;
+  }
+
+  /* when the Start signal on. */
+  _debug("Start Signal ON:");
+
+  // Start normaly
+  if (frameId != "") {
+    clearOkNg();
+    busy_on();
+    sendSsif("Q:" + frameId); //send FrameId judge request.
+  }
+  // Start befor Read (send ERROR to ssif).
+  else {
+    clearOkNg();
+    busy_on();
+    sendSsif("E:Start before read."); // send error to SSIF.
+    ng_on();
+    delay(10);
+    clearSr700();
+    busy_off();
+    _debug("Result = NG");
+    goto LAST;
+  }
+
+  /* Wait for the judge result. */
+  switch (waitForResult()) {
+
+    case 0: // FrameId OK.
+      ok_on();
+      delay(10);
+      clearSr700();
+      busy_off();
+      _debug("Result = OK");
+      break;
+
+    case 1: // FrameId NG.
+      ng_on();
+      delay(10);
+      clearSr700();
+      busy_off();
+      _debug("Result = NG");
+      break;
+
+    default: // Request Timed out.
+      clearOkNg();
+      delay(10);
+      busy_off();
+      clearSr700();
+      ssifReadyFlg = false;
+      _debug("Result = Timeout");
+      _debug("SSIF is NOT READY");
+      goto LAST;
+  }
 
 
+  /* Loop End */
+LAST:
+  //  if (1); // do nothing.
+  led(ssifReadyFlg); // When SS is ready, LED is ON
+}
 
 
-//int testPin = PD3;
+/* ---------------------------------------------------
+ MISC
+--------------------------------------------------- */
+
+void clearOkNg() {
+  ok_off();
+  ng_off();
+}
+
+void resetPins() {
+  busy_off();
+  ok_off();
+  ng_off();
+  out4_off();
+}
+
+// Clear SR700 Incoming text and reset flg.
+void clearSr700() {
+  serialCheckSr700();
+  readSr700();
+  frameId = "";
+  strSerialIncomingSr700 = "";
+  blnStringCompleteSr700 = false;
+}
+
+int waitForResult() {
+  unsigned long timerStart = millis(); // update current time.
+  unsigned long timerBlink = millis(); // update current time.
+  unsigned long blinkIntervalMs = 100; // LED Blink interval
+
+  boolean st = false;
+  _debug("waitForResult: ");
+
+  while (1) {
+    // LED Blink
+    if (millis() - timerBlink > blinkIntervalMs) {
+      timerBlink = millis();
+      st = !st;
+      led(st);
+    }
+
+    // Check for the time out.
+    if (millis() - timerStart > ResultTimeOutMs) {
+      return 2;
+    }
+
+    // Wait for the Answer.
+    if (serialCheckSsif()) {
+      String result = readSsif();
+      _debug("SerialSsif Recieve:[" + result + "]");
+      if (result == "A:OK") {
+        return 0;
+      }
+      else if (result == "A:NG") {
+        return 1;
+      }
+    }
+  }
+}
+
+void led(boolean state) {
+  if (state) {
+    digitalWrite(ledPin, HIGH);
+  } else {
+    digitalWrite(ledPin, LOW);
+  }
+}
 
 
+/* ---------------------------------------------------
+ Initialize
+--------------------------------------------------- */
 
-String strSerialIncomingSsif;
-String strSerialIncomingSr700;
+void initializePins() {
 
-const long interval = 1000;           // interval at which to blink (milliseconds)
-unsigned long previousMillis = 0;        // will store last time LED was updated
-int ledState = LOW;             // ledState used to set the LED
-
-
-const long Sr700CodeReadInterval = 1000;
-unsigned long Sr700CodeReadPreviousMillis = 0;        // will store last time LED was updated
-
-
-
-
-const long busyInterval = 1000;
-int busyOldState = LOW;
-
-
-
-
-
-
-void setup()
-{
-
+  /* initialize Pins */
   pinMode(Sr700ReadPin, OUTPUT);
   pinMode(Sr700NothingPin, OUTPUT);
   pinMode(Sr700OkPin, INPUT);
@@ -72,20 +340,17 @@ void setup()
   pinMode(Sr700ErrorPin, INPUT);
   pinMode(Sr700BusyPin, INPUT);
 
-  pinMode(dbIn1Pin, INPUT);
-  pinMode(dbIn2Pin, INPUT);
-  pinMode(dbIn3Pin, INPUT);
-  pinMode(dbIn4Pin, INPUT);
+  pinMode(dbIn1Pin, INPUT_PULLUP);
+  pinMode(dbIn2Pin, INPUT_PULLUP);
+  pinMode(dbIn3Pin, INPUT_PULLUP);
+  pinMode(dbIn4Pin, INPUT_PULLUP);
 
   pinMode(dbOut1Pin, OUTPUT);
   pinMode(dbOut2Pin, OUTPUT);
   pinMode(dbOut3Pin, OUTPUT);
   pinMode(dbOut4Pin, OUTPUT);
 
-
-
-  //  pinMode(testPin, OUTPUT);
-  //  digitalWrite(testPin, LOW);
+  pinMode(ledPin, OUTPUT);
 
   digitalWrite(Sr700ReadPin, LOW);
   digitalWrite(Sr700NothingPin, LOW);
@@ -95,63 +360,32 @@ void setup()
   digitalWrite(dbOut3Pin, LOW);
   digitalWrite(dbOut4Pin, LOW);
 
-
-
-
-
-  Serial.begin(115200);
-  Serial1.begin(115200);
-  while (!Serial);
-
-
-
+  digitalWrite(ledPin, LOW);
 }
 
-void loop()
-{
+void initializeSerials() {
+  /* initialize Serials */
+  Serial.begin(115200);  // SSIF
+  Serial1.begin(115200); // SR-700
 
-SerialIncomingSr700();
-
-SerialIncomingSsif();
-
-//
-//  busy_on();
-//  delay(200);
-//  busy_off();
-//  delay(200);
-//
-//  ok_on();
-//  delay(200);
-//  ok_off();
-//  delay(200);
-//
-//  ng_on();
-//  delay(200);
-//  ng_off();
-//  delay(200);
-//
-//  out4_on();
-//  delay(200);
-//  out4_off();
-//  delay(200);
+  // reserve 200 bytes for the incoming strings:
+  strSerialIncomingSsif.reserve(200);
+  strSerialIncomingSr700.reserve(200);
+  frameId.reserve(200);
 
 }
-
-
-
-
-
-
 
 /* ---------------------------------------------------
-  Method
+  SS I/F
 --------------------------------------------------- */
 
-void checkInPins() {
-  
-  
-  
-  
+void sendInputState() {
+  Serial.print("i:");
+  Serial.print(readStartPin());
+  Serial.print(readLotClearPin());
+  Serial.print(readDbIn3Pin());
+  Serial.print(readDbIn4Pin());
+  Serial.println("");
 }
 
 
@@ -159,39 +393,46 @@ void checkInPins() {
   DieBonder
 --------------------------------------------------- */
 
-// digitalWrite
+/* digitalWrite */
 
+// busy (OUT 1)
 void busy_on() {
   digitalWrite(busyPin, HIGH);
+  _debug(" busy_on");
+  delay(100);
 }
 void busy_off() {
   digitalWrite(busyPin, LOW);
+  _debug(" busy_off");
 }
 
+// ok (OUT 2)
 void ok_on() {
   digitalWrite(okPin, HIGH);
+  _debug(" ok_on");
 }
 void ok_off() {
   digitalWrite(okPin, LOW);
+  _debug(" ok_off");
 }
 
+// ng (OUT 3)
 void ng_on() {
   digitalWrite(ngPin, HIGH);
+  _debug(" ng_on");
 }
 void ng_off() {
   digitalWrite(ngPin, LOW);
+  _debug(" ng_off");
 }
 
-
+// reserved (OUT 4)
 void out4_on() {
   digitalWrite(dbOut4Pin, HIGH);
 }
 void out4_off() {
   digitalWrite(dbOut4Pin, LOW);
 }
-
-
-
 
 //-----
 void Busy(int state) {
@@ -204,277 +445,126 @@ void Ng(int state) {
   digitalWrite(busyPin, state);
 }
 
-// digitalRead
-int ReadStartPin() {
+/* digitalRead */
+// Input pins from DB are Active Low.
+// So, invert the read states.
 
-  return digitalRead(startPin) ;
+// Start (IN 1)
+boolean readStartPin() {
+  if (digitalRead(startPin)) {
+    return false;
+  } else {
+    return true;
+  }
 }
-
-
-
+// Lot Clear (IN 2)
+boolean readLotClearPin() {
+  if (digitalRead(lotClearPin)) {
+    return false;
+  } else {
+    return true;
+  }
+}
+// (IN 3)
+boolean readDbIn3Pin() {
+  if (digitalRead(dbIn3Pin)) {
+    return false;
+  } else {
+    return true;
+  }
+}
+// (IN 4)
+boolean readDbIn4Pin() {
+  if (digitalRead(dbIn4Pin)) {
+    return false;
+  } else {
+    return true;
+  }
+}
 
 
 /* ---------------------------------------------------
-  SR700
+  Serials
 --------------------------------------------------- */
-
-
-
-int Sr700ReadCode() {
-
-  static int state = LOW;
-  boolean flg = false;
-
-
-  // SR700 Read Start.
-  Serial.println("On1=on");
-
-  digitalWrite(Sr700ReadPin, HIGH);
-
-
-
-  int oldBusyState = 0;
-  int BusyState = 0;
-
-  delay(10);
-
-  while (1) {
-    BusyState = digitalRead(Sr700BusyPin);
-
-    if (oldBusyState == LOW) {
-      Serial.println("B=ON");
-      break;
-    }
-
-    delay(5);
-    oldBusyState = BusyState;
-
-    // Wait for BUSY ON.
-  }
-
-  delay(100);
-
-
-  Sr700CodeReadPreviousMillis = millis();
-  oldBusyState = 0;
-  BusyState = 0;
-  while (1) {
-    unsigned long cm = millis();
-
-    BusyState = digitalRead(Sr700BusyPin);
-
-    if (BusyState == 1) {
-      _brOut1Off();
-      //      digitalWrite(testPin, HIGH);
-      Serial.println("Busy=OFF");
-      break;
-    }
-
-    if ((cm - Sr700CodeReadPreviousMillis) >= 1000) {
-      // SR700 Read End.
-      Serial.print("On1=offffff ");
-      Serial.print(cm);
-      Serial.print(" ");
-      Serial.print(Sr700CodeReadPreviousMillis);
-      Serial.print(" ");
-
-      Serial.println(cm - Sr700CodeReadPreviousMillis);
-
-
-
-      digitalWrite(Sr700ReadPin, LOW);
-
-    }
-
-    delay(5);
-    oldBusyState = BusyState;
-
-  }
-
-  delay(100);
-
-  if (readSr700OkPin() == LOW) {
-    Serial.println("Pass Low");
-
-    delay(10);
-    _checkSerialIncomingSr700();
-
-    return HIGH;
-  }
-
-
-
-
-
-
-  if (readSr700NgPin() == LOW) {
-
-    Serial.println("NG LOW");
-    delay(10);
-    _checkSerialIncomingSr700();
-
-
-    return LOW;
-  }
-
-
-
-
-  //  digitalWrite(testPin, LOW);
+void serialCheck() {
+  serialCheckSsif();
+  serialCheckSr700();
 }
 
-
-int readSr700BusyPin() {
-  if (digitalRead(Sr700BusyPin) == HIGH) {
-    return HIGH;
-  }
-  else {
-    return LOW;
-  }
-}
-
-int readSr700OkPin() {
-  if (digitalRead(Sr700OkPin) == HIGH) {
-    return HIGH;
-  }
-  else {
-    return LOW;
-  }
-}
-
-int readSr700NgPin() {
-  if (digitalRead(Sr700NgPin) == HIGH) {
-    return HIGH;
-  }
-  else {
-    return LOW;
-  }
-}
-
-
-
-void _brOut1On() {
-  digitalWrite(Sr700ReadPin, HIGH);
-}
-void _brOut1Off() {
-  digitalWrite(Sr700ReadPin, LOW);
-}
-void _brOut2On() {
-  digitalWrite(Sr700NothingPin, HIGH);
-}
-void _brOut2Off() {
-  digitalWrite(Sr700NothingPin, LOW);
-}
-
-
-
-
-
-/* ---------------------------------------------------
-  SERIALs
---------------------------------------------------- */
-
-// -- Serial Event --
-void SerialIncomingSsif() {
-  Serial.print(strSerialIncomingSsif);
-}
-
-void SerialIncomingSr700() {
-  Serial.print(strSerialIncomingSr700);
-}
-
-
-void checkSerials() {
-  _checkSerialIncomingSsif();
-  _checkSerialIncomingSr700();
-}
-
-void _checkSerialIncomingSsif() {
-  __serialReadLineSsifCheckSsif();
-  strSerialIncomingSsif = serialReadLineSsif();
-      SerialIncomingSsif();
-
-  if (strSerialIncomingSsif.length() > 0) {
-  }
-}
-void _checkSerialIncomingSr700() {
-  __serialReadLineSsifCheckSsifSr700();
-  strSerialIncomingSr700 = __serialReadLineSsifSr700();
-      SerialIncomingSr700();
-
-  if (strSerialIncomingSr700.length() > 0) {
-  }
-
-}
-
-
-
-//-Serial SSIF --------------------------------------
-String _strSerialIncomingSsif, _strBuf;
-int _readFlg = 0;
-
-void __serialReadLineSsifCheckSsif(void) {
+boolean serialCheckSsif() {
   while (Serial.available()) {
-    //delay(3);  //delay to allow buffer
-    if (Serial.available() > 0) {
-      char c = Serial.read();  //gets one byte from serial buffer
-      if ((_readFlg == 0) && ((c == '\r') || (c == '\n'))) {
-        _strSerialIncomingSsif = _strBuf;
-        _strBuf = "";
-        _readFlg = 1;
-      }
-      else if ((_readFlg == 1) && ((c == '\r') || (c == '\n'))) {
-        //do nothing
-      }
-      else {
-        _strBuf += c;
-      }
+    char inChar = (char)Serial.read();
+
+    // Ignore terminate character
+    if (inChar != '\r' && inChar != '\n') {
+      strSerialIncomingSsif += inChar;
+    }
+
+    // Detect terminate character
+    if (inChar == '\n') {
+      blnStringCompleteSsif = true;
+      return true;
     }
   }
+  return false;
 }
 
-String serialReadLineSsif(void) {
-  String s = "";
-  if (_readFlg) {
-    s = _strSerialIncomingSsif; //see what was received
-    _strSerialIncomingSsif = "";
-    _readFlg = 0;
+
+String readSsif() {
+  String strReturn = "";
+  if (blnStringCompleteSsif) {
+    strReturn = strSerialIncomingSsif;
+    // clear the string:
+    strSerialIncomingSsif = "";
+    blnStringCompleteSsif = false;
   }
-  return s;
+  return strReturn;
 }
 
-//-Serial SR700 --------------------------------------
-String _strSerialIncomingSr700, _strBuf1;
-int _readFlg1 = 0;
-
-void __serialReadLineSsifCheckSsifSr700(void) {
+boolean serialCheckSr700() {
   while (Serial1.available()) {
-    //delay(3);  //delay to allow buffer
-    if (Serial1.available() > 0) {
-      char c = Serial1.read();  //gets one byte from serial buffer
-      if ((_readFlg1 == 0) && ((c == '\r') || (c == '\n'))) {
-        _strSerialIncomingSr700 = _strBuf1;
-        _strBuf1 = "";
-        _readFlg1 = 1;
-      }
-      else if ((_readFlg1 == 1) && ((c == '\r') || (c == '\n'))) {
-        //do nothing
-      }
-      else {
-        _strBuf1 += c;
-      }
+    char inChar = (char)Serial1.read();
+
+    // Ignore terminate character
+    if (inChar != '\r' && inChar != '\n') {
+      strSerialIncomingSr700 += inChar;
+    }
+
+    // Detect terminate character
+    if (inChar == '\n') {
+      blnStringCompleteSr700 = true;
+      return true;
     }
   }
+  return false;
 }
 
-String __serialReadLineSsifSr700(void) {
-  String s = "";
-  if (_readFlg1) {
-    s = _strSerialIncomingSr700; //see what was received
-    _strSerialIncomingSr700 = "";
-    _readFlg1 = 0;
+String readSr700() {
+  String strReturn = "";
+  if (blnStringCompleteSr700) {
+    strReturn = strSerialIncomingSr700;
+    // clear the string:
+    strSerialIncomingSr700 = "";
+    blnStringCompleteSr700 = false;
   }
-  return s;
+  return strReturn;
 }
 
-// --- END OF CODE ---
+
+void sendSsif(String sendString1) {
+  Serial.println(sendString1);
+  delay(SERIAL_LINE_DELAY);
+}
+
+
+/* ---------------------------------------------------
+  Debug
+--------------------------------------------------- */
+void _debug(String str) {
+  if (DBG) {
+    Serial.println("debug:" + str);
+    delay(SERIAL_LINE_DELAY);
+  }
+}
+
+// ----- END OF CODE -----
